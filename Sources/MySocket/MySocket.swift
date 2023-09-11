@@ -1,8 +1,8 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
-
 import Foundation
-import Darwin
+import System
+//import Darwin
+
+public let defaultPort: UInt16 = 10000
 
 public struct MySockAddress {
     var Csockaddr_in: sockaddr_in
@@ -12,31 +12,58 @@ public struct MySockAddress {
         Csockaddr_in.sin_family = sa_family_t(sockFamily)
         Csockaddr_in.sin_addr.s_addr = sAddr
     }
+    
+    public init(port: UInt16, sockFamily: Int32 = AF_INET, ipv4: UnsafePointer<CChar>) {
+        var sockaddr_in = sockaddr_in()
+        sockaddr_in.sin_port = port.bigEndian
+        sockaddr_in.sin_family = sa_family_t(sockFamily)
+        let _ = withUnsafeMutableBytes(of: &sockaddr_in.sin_addr.s_addr) { rawBufferPointer in
+            inet_pton(AF_INET, ipv4, rawBufferPointer.baseAddress!)
+        }
+        self.Csockaddr_in = sockaddr_in
+    }
 }
+
 
 public struct Socket: ~Copyable {
     /// The file descriptor of the socket.
-    public let socketFileDescriptor: Int32
+    public let socketFileDescriptor: FileDescriptor
+    
     private var port: UInt16?
     
-    // MARK: Buggy function call
     public mutating func bind(address: MySockAddress) throws {
         self.port = address.Csockaddr_in.sin_port.bigEndian
         
         let bindResult = withUnsafePointer(to: address.Csockaddr_in) { addressPtr in
             addressPtr.withMemoryRebound(to: Darwin.sockaddr.self, capacity: 1) { pointer in
-                return Darwin.bind(socketFileDescriptor,
+                return Darwin.bind(socketFileDescriptor.rawValue,
                                    pointer,
                                    socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
+        
         guard bindResult != -1 else {
             throw SocketError.bindFailed
         }
     }
     
+    public func connect(address: MySockAddress) throws {
+        let connectResult = withUnsafePointer(to: address.Csockaddr_in) { addressPtr in
+            addressPtr.withMemoryRebound(to: Darwin.sockaddr.self, capacity: 1) { pointer in
+                return Darwin.connect(
+                    socketFileDescriptor.rawValue,
+                    pointer,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+            }
+        }
+        guard connectResult != -1 else {
+            throw SocketError.connectFailed
+        }
+    }
+    
     public func listen() throws {
-        let listenResult = Darwin.listen(socketFileDescriptor, SOMAXCONN)
+        let listenResult = Darwin.listen(socketFileDescriptor.rawValue, SOMAXCONN)
         guard listenResult != -1 else {
             throw SocketError.listenFailed
         }
@@ -44,52 +71,73 @@ public struct Socket: ~Copyable {
     }
     
     public func accept() throws -> Socket {
-        return try Socket(Darwin.accept(self.socketFileDescriptor, nil, nil))
+        return try Socket(Darwin.accept(self.socketFileDescriptor.rawValue, nil, nil))
     }
     
     
     public init(_ socketFileDescriptor: Int32) throws {
         guard socketFileDescriptor != -1 else { throw SocketError.createFailed }
-        self.socketFileDescriptor = socketFileDescriptor
+        self.socketFileDescriptor = FileDescriptor(rawValue: socketFileDescriptor)
     }
     
     /// Sends data over the socket.
     /// - Parameter data: The data to send.
     /// - Throws: SocketError if sending fails.
-    public func sendData(_ data: Data) throws {
-        try data.withUnsafeBytes { bufferPointer in
-            let bufferAddress = bufferPointer.bindMemory(to: UInt8.self).baseAddress
-            let bufferLength = bufferPointer.count
-            
-            let bytesSent = write(socketFileDescriptor, bufferAddress, bufferLength)
-            guard bytesSent != -1 else {
-                throw SocketError.sendFailed(String(errno))
-            }
+    public func send(_ data: Data) throws {
+        try socketFileDescriptor.writeAll(data)
+    }
+    
+    public func send(_ int: Int) throws {
+        let _ = try withUnsafeBytes(of: int.bigEndian) {
+            try socketFileDescriptor.writeAll(Data($0))
         }
     }
     
     /// Receives data from the socket.
     /// - Returns: The received data.
     /// - Throws: SocketError if receiving fails.
-    public func receiveData() throws -> Data {
-        var receivedData = Data()
-        let bufferSize = 4096
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
-        let bytesRead = read(socketFileDescriptor, &buffer, bufferSize)
-        guard bytesRead >= 0 else {
-            throw SocketError.receiveFailed(String(errno))
+    public func receive() throws -> Data {
+        var receivedData = Data(capacity: 4096)
+        // MARK: ?
+        let _ = try receivedData.withUnsafeMutableBytes { rawBufferPointer in
+            let _ = try socketFileDescriptor.read(into: rawBufferPointer)
         }
-        receivedData.append(contentsOf: buffer[0..<bytesRead])
+        
         return receivedData
+    }
+    
+    public func receiveInt() throws -> Int {
+        let data = try self.receive()
+        guard data.count == MemoryLayout<Int>.size else {
+            throw SocketError.memoryLayoutDontMatch
+        }
+        
+        return try data.withUnsafeBytes { rawBufferPointer in
+            let bufferPointer = rawBufferPointer.bindMemory(to: Int.self)
+            guard let first = bufferPointer.first else {
+                throw SocketError.memoryLayoutDontMatch
+            }
+            return first.bigEndian
+        }
+        
+        
     }
     
     /// Closes the socket.
     public consuming func close() {
-        Darwin.close(socketFileDescriptor)
+        do {
+            try socketFileDescriptor.close()
+        }catch {
+            print(error.localizedDescription)
+        }
     }
     
     deinit {
-        Darwin.close(socketFileDescriptor)
+        do {
+            try socketFileDescriptor.close()
+        }catch{
+            print(error.localizedDescription)
+        }
     }
     
     /// Sends a file over the socket.
@@ -97,11 +145,8 @@ public struct Socket: ~Copyable {
     /// - Throws: SocketError if sending fails.
     public func sendFile(data: Data) throws {
         let fileSize = data.count
-        // send file byte count
-        let fileSizeData = withUnsafeBytes(of: fileSize.bigEndian) { Data($0) }
-        
-        try sendData(fileSizeData) // Send the total file size to the other end
-        print("send fileSize: \(fileSize)")
+        try send(fileSize)
+        print("send fileSize: \(fileSize) bytes")
         let bufferSize = 4096 // Adjust the buffer size as per your needs
         
         var bytesSent = 0
@@ -111,7 +156,7 @@ public struct Socket: ~Copyable {
             let bufferSizeToSend = min(bufferSize, remainingSize)
             let buffer = data.subdata(in: bytesSent..<bytesSent+bufferSizeToSend)
             
-            try sendData(buffer) // Send the buffer of file data
+            try send(buffer) // Send the buffer of file data
             
             bytesSent += bufferSizeToSend
         }
@@ -121,30 +166,26 @@ public struct Socket: ~Copyable {
     /// Extracts an integer from the provided data.
     /// - Parameter data: The data containing the integer.
     /// - Returns: The extracted integer, or nil if extraction fails.
-    func extractInt(from data: Data) -> Int? {
-        guard data.count == MemoryLayout<Int>.size else {
-            return nil // Data size does not match the size of an Int
-        }
-        
-        var intValue: Int = 0
-        
-        data.withUnsafeBytes { rawBufferPointer in
-            let bufferPointer = rawBufferPointer.bindMemory(to: Int.self)
-            intValue = bufferPointer.first!.bigEndian
-        }
-        
-        return intValue
-    }
+    //    func extractInt(from data: Data) throw -> Int {
+    //        guard data.count == MemoryLayout<Int>.size else {
+    //            return nil // Data size does not match the size of an Int
+    //        }
+    //
+    //        var intValue: Int = 0
+    //
+    //        data.withUnsafeBytes { rawBufferPointer in
+    //            let bufferPointer = rawBufferPointer.bindMemory(to: Int.self)
+    //            intValue = bufferPointer.first!.bigEndian
+    //        }
+    //
+    //        return intValue
+    //    }
     
     /// Receives a file from the socket.
     /// - Returns: The received file data, or nil if receiving fails.
     /// - Throws: SocketError if receiving fails.
     public func receiveFile() throws -> Data? {
-        let fileSizeData = try receiveData()
-        
-        guard let fileSize = extractInt(from: fileSizeData.subdata(in: 0..<MemoryLayout<Int>.size)) else {
-            return nil
-        }
+        let fileSize = try receiveInt()
         print("receiving file size: \(fileSize)")
         
         var receivedData = Data()
@@ -156,7 +197,7 @@ public struct Socket: ~Copyable {
             let remainingSize = fileSize - bytesReceived
             let bufferSizeToReceive = min(bufferSize, remainingSize)
             
-            let buffer = try receiveData() // Receive the buffer of file data
+            let buffer = try receive() // Receive the buffer of file data
             receivedData.append(buffer)
             
             bytesReceived += bufferSizeToReceive
@@ -175,6 +216,8 @@ public enum SocketError: Error {
     case bindFailed
     case listenFailed
     case acceptFailed
+    case connectFailed
+    case memoryLayoutDontMatch
 }
 
 

@@ -26,5 +26,23 @@ let package = Package(
                 .copy("Resources/")
             ]
         ),
+        .executableTarget(
+            name: "MyClient",
+            dependencies: [
+                "MySocket"
+            ],
+            resources: [
+                .copy("Resources/")
+            ]
+        ),
+        .testTarget(
+            name: "MyClientTests",
+            dependencies: [
+                "MyClient"
+            ],
+            resources: [
+                .copy("Resources/")
+            ]
+        )
     ]
 )
